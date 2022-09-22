@@ -119,6 +119,7 @@ if __name__ == "__main__":
     agent = ActorCritic(
         actor=actor_model, 
         critic=critic_model,
+        recurrent_critic=True,
         actor_output_size=action_space,
         min_seq_size=2,
         device=device)
@@ -128,8 +129,9 @@ if __name__ == "__main__":
         actor_critic=agent,
         num_steps=num_steps,
         num_envs=num_envs,
-        observation_space=observation_space,
-        action_space=action_space,
+        obs_size_actor=observation_space,
+        obs_size_critic=observation_space,
+        action_size=action_space,
         learning_rate=3e-4,
         num_minibatches=2,
         update_epochs=4,
@@ -168,14 +170,14 @@ if __name__ == "__main__":
             obs = next_obs
             dones = next_dones
 
-            actions, logprobs, values, actor_state, critic_state = ppo.act(obs, actor_state, critic_state, dones)
+            actions, logprobs, values, actor_state, critic_state = ppo.act(obs, obs, actor_state, critic_state, dones)
             next_obs, rewards, next_dones, info = envs.step(actions.cpu().numpy())
 
             next_obs = torch.tensor(next_obs).to(device)
             rewards = torch.tensor(rewards).to(device)
             next_dones = torch.tensor(next_dones).to(device)
 
-            ppo.set_step(obs, actions, logprobs, rewards, dones, values)
+            ppo.set_step(obs, obs, actions, logprobs, rewards, dones, values)
 
         ppo.compute_returns(next_obs, critic_state, next_dones)
 

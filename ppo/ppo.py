@@ -16,8 +16,9 @@ class PPO:
         actor_critic: ActorCritic,
         num_steps: int,
         num_envs: int,
-        observation_space: int,
-        action_space: int,
+        obs_size_actor: int,
+        obs_size_critic: int,
+        action_size: int,
         learning_rate: float,
         num_minibatches: int,
         update_epochs: int,
@@ -36,8 +37,8 @@ class PPO:
         """
         num_steps: number of steps to run in each environment per policy rollout
         num_envs: number of parallel game environments
-        observation_space: 
-        action_space: 
+        observation_size: shape of input to actor/critic
+        action_size: shape of output of actor
         learning_rate: learning rate of the optimizer
         num_minibatches: number of mini-batches
         update_epochs: number of epochs to update the policy
@@ -57,8 +58,9 @@ class PPO:
         self._actor_critic = actor_critic
         self._num_steps = num_steps
         self._num_envs = num_envs
-        self._observation_space = observation_space
-        self._action_space = action_space
+        self._obs_size_actor = obs_size_actor
+        self._obs_size_critic = obs_size_critic
+        self._action_size = action_size
         self._learning_rate = learning_rate
         self._num_minibatches = num_minibatches
         self._update_epochs = update_epochs
@@ -85,8 +87,9 @@ class PPO:
 
     def _init_storage(self):
         # storage setup
-        self._obs = torch.zeros((self._num_steps, self._num_envs, self._observation_space)).to(self._device)
-        self._actions = torch.zeros((self._num_steps, self._num_envs, self._action_space)).to(self._device)
+        self._obs_actor = torch.zeros((self._num_steps, self._num_envs, self._obs_size_actor)).to(self._device)
+        self._obs_critic = torch.zeros((self._num_steps, self._num_envs, self._obs_size_critic)).to(self._device)
+        self._actions = torch.zeros((self._num_steps, self._num_envs, self._action_size)).to(self._device)
         self._logprobs = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._rewards = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._dones = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
@@ -95,30 +98,29 @@ class PPO:
         self._returns = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._step = 0
 
-    def act(self, obs, actor_state, critic_state, dones):
+    def act(self, obs_actor, obs_critic, actor_state, critic_state, dones):
         with torch.no_grad():
-            actions, logprobs, _, actor_state = self._actor_critic.get_action(obs, actor_state, dones)
-            values, critic_state = self._actor_critic.get_value(obs, critic_state, dones)
+            actions, logprobs, _, actor_state = self._actor_critic.get_action(obs_actor, actor_state, dones)
+            values, critic_state = self._actor_critic.get_value(obs_critic, critic_state, dones)
             
         return actions, logprobs, values, actor_state, critic_state
 
-    def set_step(self, obs, actions, logprobs, rewards, dones, values):
-
-        self._obs[self._step] = obs
+    def set_step(self, obs_actor, obs_critic, actions, logprobs, rewards, dones, values):
+        self._obs_actor[self._step] = obs_actor
+        self._obs_critic[self._step] = obs_critic
         self._actions[self._step] = actions
         self._logprobs[self._step] = logprobs
         self._rewards[self._step] = rewards
         self._dones[self._step] = dones
         self._values[self._step] = values.flatten()
-    
         # increment step
         self._step += 1
 
-    def compute_returns(self, obs, critic_state, dones):
+    def compute_returns(self, obs_critic, critic_state, dones):
         # bootstrap value if not done
         with torch.no_grad():
             value, _ = self._actor_critic.get_value(
-                obs,
+                obs_critic,
                 critic_state,
                 dones,
             )
@@ -148,12 +150,13 @@ class PPO:
                     self._returns[t] = self._rewards[t] + self._gamma * nextnonterminal * next_return
                 self._advantages = self._returns - self._values
 
-    def update(self, initial_actor_state, initial_critic_state):
+    def update(self, initial_actor_state: torch.Tensor, initial_critic_state: Union[None, torch.Tensor]):
 
         # flatten the data
-        obs_flat = self._obs.reshape((-1, self._observation_space))
+        obs_actor_flat = self._obs_actor.reshape((-1, self._obs_size_actor))
+        obs__critic_flat = self._obs_critic.reshape((-1, self._obs_size_critic))
         logprobs_flat = self._logprobs.reshape(-1)
-        actions_flat = self._actions.reshape((-1, self._action_space))
+        actions_flat = self._actions.reshape((-1, self._action_size))
         dones_flat = self._dones.reshape(-1)
         advantages_flat = self._advantages.reshape(-1)
         returns_flat = self._returns.reshape(-1)
@@ -175,14 +178,14 @@ class PPO:
                 mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
                 _, newlogprob, entropy, _ = self._actor_critic.get_action(
-                    obs_flat[mb_inds],
+                    obs_actor_flat[mb_inds],
                     initial_actor_state[..., mbenvinds, :],
                     dones_flat[mb_inds],
                     actions_flat[mb_inds],
                 )
                 newvalue, _ = self._actor_critic.get_value(
-                    obs_flat[mb_inds],
-                    initial_critic_state[..., mbenvinds, :],
+                    obs__critic_flat[mb_inds],
+                    initial_critic_state[..., mbenvinds, :] if torch.is_tensor(initial_critic_state) else None,
                     dones_flat[mb_inds],
                 )
                 logratio = newlogprob - logprobs_flat[mb_inds]
@@ -226,9 +229,8 @@ class PPO:
                 torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
                 self._optimizer.step()
 
-            if self._target_kl is not None:
-                if approx_kl > self._target_kl:
-                    break
+            if self._target_kl is not None and approx_kl > self._target_kl:
+                break
 
         # reset storage
         self._init_storage()

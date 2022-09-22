@@ -12,6 +12,7 @@ class ActorCritic(torch.nn.Module):
             self,
             actor: torch.nn.Module,
             critic: torch.nn.Module,
+            recurrent_critic: bool,
             actor_output_size: int,
             min_seq_size: int,
             device: str):
@@ -20,6 +21,7 @@ class ActorCritic(torch.nn.Module):
 
         self._actor = actor
         self._critic = critic
+        self._recurrent_critic = recurrent_critic
         self._actor_output_size = actor_output_size
         self._min_seq_size = min_seq_size
 
@@ -33,7 +35,6 @@ class ActorCritic(torch.nn.Module):
         This is accomplished by splitting the input sequence everywhere where
         there's a done and padding the rest of the sequence.
 
-        Visualization:
         Original sequences: [[a1, a2, a3, a4 | a5, a6],
                              [b1, b2 | b3, b4, b5 | b6]]
 
@@ -174,7 +175,11 @@ class ActorCritic(torch.nn.Module):
         return outputs, hidden_states
 
     def get_value(self, obs, hidden_states, dones):
-        value, hidden_states = self._process_sequence(self._critic, obs, hidden_states, dones)
+        if self._recurrent_critic:
+            assert hidden_states != None
+            value, hidden_states = self._process_sequence(self._critic, obs, hidden_states, dones)
+        else:
+            value = self._critic(obs)
         return value, hidden_states
 
     def get_action(self, obs, hidden_states, dones, action=None):
