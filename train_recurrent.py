@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from ppo import PPO, ActorCritic
+from ppo import RecurrentPPO, ActorCritic
 
 from uncertainty_networks.uncertainty_networks import UncertaintyNetwork
 
@@ -28,10 +28,10 @@ class DiscreteActions(gym.ActionWrapper):
         return np.where(act <= 0, 0, 1)[0]
 
 
-def eval(eval_env, policy, render=False):
+def eval(eval_env, agent, render=False):
 
-    policy.eval()
-    eval_hidden = policy.init_hidden(1)
+    agent.eval()
+    eval_hidden = agent.init_hidden(1)
 
     eval_obs = eval_env.reset()
     eval_obs = torch.from_numpy(eval_obs[..., :observation_space]).to(device)
@@ -40,7 +40,7 @@ def eval(eval_env, policy, render=False):
     eval_reward = 0.
     with torch.inference_mode():
         while True:
-            action, eval_hidden = policy(eval_obs.unsqueeze(0).unsqueeze(0), eval_hidden)
+            action, eval_hidden = agent.get_action_inference(eval_obs.unsqueeze(0).unsqueeze(0), eval_hidden)
             eval_obs, reward, done, info = eval_env.step(action[0, 0].cpu().numpy())
             if render:
                 eval_env.render()
@@ -62,7 +62,7 @@ if __name__ == "__main__":
     # arguments
     seed = 5555
     num_updates = 50
-    num_envs = 50
+    num_envs = 100
     num_steps = 500
     device = "cuda"
 
@@ -119,13 +119,14 @@ if __name__ == "__main__":
     agent = ActorCritic(
         actor=actor_model, 
         critic=critic_model,
+        recurrent_actor=True,
         recurrent_critic=True,
         actor_output_size=action_space,
         min_seq_size=2,
         device=device)
 
     # PPO
-    ppo = PPO(
+    ppo = RecurrentPPO(
         actor_critic=agent,
         num_steps=num_steps,
         num_envs=num_envs,
@@ -146,6 +147,7 @@ if __name__ == "__main__":
         max_grad_norm=0.5,
         target_kl=0.01,
         learning_rate_gamma=0.999,
+        min_seq_size=2,
         device=device)
 
     global_step = 0
@@ -158,24 +160,22 @@ if __name__ == "__main__":
     for update in range(1, num_updates + 1):
         initial_actor_state = actor_state.clone()
         initial_critic_state = critic_state.clone()
-        # Annealing the rate if instructed to do so.
-        # if args.anneal_lr:
-        #     frac = 1.0 - (update - 1.0) / num_updates
-        #     lrnow = frac * args.learning_rate
-        #     optimizer.param_groups[0]["lr"] = lrnow
 
-        # TODO update learning rate
         for step in range(0, num_steps):
             global_step += 1 * num_envs
             obs = next_obs
             dones = next_dones
 
-            actions, logprobs, values, actor_state, critic_state = ppo.act(obs, obs, actor_state, critic_state, dones)
+            actions, logprobs, values, actor_state, critic_state = ppo.act(obs, obs, actor_state, critic_state)
             next_obs, rewards, next_dones, info = envs.step(actions.cpu().numpy())
 
             next_obs = torch.tensor(next_obs).to(device)
             rewards = torch.tensor(rewards).to(device)
             next_dones = torch.tensor(next_dones).to(device)
+
+            # reset hidden states of dones
+            actor_state[..., next_dones > 0.5, :] = 0.
+            critic_state[..., next_dones > 0.5, :] = 0.
 
             ppo.set_step(obs, obs, actions, logprobs, rewards, dones, values)
 
@@ -193,6 +193,6 @@ if __name__ == "__main__":
 
         # evaluate
         if update % 10 == 0:
-            eval_rewards.append(eval(eval_env, agent.policy, render=False))
+            eval_rewards.append(eval(eval_env, agent, render=False))
 
     envs.close()

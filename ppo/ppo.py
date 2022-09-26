@@ -1,15 +1,18 @@
 
 from .actor_critic import ActorCritic
+from .dataset import RecurrentPPODataset
 
 from typing import Union
 import numpy as np
 import torch
+from torch.utils.data import TensorDataset, BatchSampler, RandomSampler
 
-class PPO:
+
+class RecurrentPPO:
     """
     Implementation of PPO based on:
     https://github.com/vwxyzjn/cleanrl
-    https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/
+    https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/    
     """
 
     def __init__(self, 
@@ -20,7 +23,7 @@ class PPO:
         obs_size_critic: int,
         action_size: int,
         learning_rate: float,
-        num_minibatches: int,
+        num_traj_minibatch: int,
         update_epochs: int,
         use_gae: bool,
         gae_lambda: float,
@@ -33,6 +36,7 @@ class PPO:
         max_grad_norm: float,
         target_kl: Union[float, None], # not used when None
         learning_rate_gamma: Union[float, None], # not used when None
+        min_seq_size: Union[int, None], # not used when None
         device: str):
         """
         num_steps: number of steps to run in each environment per policy rollout
@@ -40,7 +44,7 @@ class PPO:
         observation_size: shape of input to actor/critic
         action_size: shape of output of actor
         learning_rate: learning rate of the optimizer
-        num_minibatches: number of mini-batches
+        num_traj_minibatch: number of trajectories in each minibatch during update
         update_epochs: number of epochs to update the policy
         use_gae: use GAE for advantage computation
         gae_lambda: lambda for the general advantage estimation
@@ -53,6 +57,7 @@ class PPO:
         max_grad_norm: maximum norm for the gradient clipping
         target_kl: if not None, target KL divergence threshold
         learning_rate_gamma: if not None, multiplicative factor of learning rate decay
+        min_seq_size: minimum length of sequence during training, all shorter sequences are discarted
         """
 
         self._actor_critic = actor_critic
@@ -62,7 +67,7 @@ class PPO:
         self._obs_size_critic = obs_size_critic
         self._action_size = action_size
         self._learning_rate = learning_rate
-        self._num_minibatches = num_minibatches
+        self._num_traj_minibatch = num_traj_minibatch
         self._update_epochs = update_epochs
         self._use_gae = use_gae
         self._gae_lambda = gae_lambda
@@ -74,7 +79,10 @@ class PPO:
         self._use_norm_adv = use_norm_adv
         self._max_grad_norm = max_grad_norm
         self._target_kl = target_kl
+        self._min_seq_size = min_seq_size
         self._device = device
+
+        self.RECURRENT = True
 
         # batch size for flat trajectories
         self._batch_size = int(self._num_envs * self._num_steps)
@@ -98,10 +106,10 @@ class PPO:
         self._returns = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._step = 0
 
-    def act(self, obs_actor, obs_critic, actor_state, critic_state, dones):
+    def act(self, obs_actor, obs_critic, actor_state, critic_state):
         with torch.no_grad():
-            actions, logprobs, _, actor_state = self._actor_critic.get_action(obs_actor, actor_state, dones)
-            values, critic_state = self._actor_critic.get_value(obs_critic, critic_state, dones)
+            actions, logprobs, _, actor_state = self._actor_critic.get_action(obs_actor, actor_state)
+            values, critic_state = self._actor_critic.get_value(obs_critic, critic_state)
             
         return actions, logprobs, values, actor_state, critic_state
 
@@ -122,7 +130,6 @@ class PPO:
             value, _ = self._actor_critic.get_value(
                 obs_critic,
                 critic_state,
-                dones,
             )
             value = value.reshape(1, -1)
             if self._use_gae:
@@ -152,43 +159,75 @@ class PPO:
 
     def update(self, initial_actor_state: torch.Tensor, initial_critic_state: Union[None, torch.Tensor]):
 
-        # flatten the data
-        obs_actor_flat = self._obs_actor.reshape((-1, self._obs_size_actor))
-        obs__critic_flat = self._obs_critic.reshape((-1, self._obs_size_critic))
-        logprobs_flat = self._logprobs.reshape(-1)
-        actions_flat = self._actions.reshape((-1, self._action_size))
-        dones_flat = self._dones.reshape(-1)
-        advantages_flat = self._advantages.reshape(-1)
-        returns_flat = self._returns.reshape(-1)
-        values_flat = self._values.reshape(-1)
+        # Preprocess collected data, create a dataset and specify sampling strategy
+        # Recurrent approach:
+        # 1. Split obs and other collected data into lists of single trajectories
+        #    (split sequences everywhere there's a done)
+        # 2. Select random trajectories and build batches of size `num_traj_minibatch`
+        # 3. Get a batch of trajectories and join them by padding the trajectories
+        # 4. After inference, apply mask to output to select only valid (non-padded) steps
+        # Benefits of this approach:
+        # - Faster inference, as we don't have to iterate over individual steps
+        # - Memory usage is limited to size of `num_traj_minibatch*num_steps`
+        #   (upper bound, as collected trajectories can be smaller)
+        if self.RECURRENT:
+            obs_actor, traj_mask, initial_actor_state, initial_critic_state,\
+            [obs_critic, actions, logprobs, advantages, returns, values] \
+                = self.split_sequences(
+                    self._obs_actor, self._dones, initial_actor_state, initial_critic_state,
+                    [self._obs_critic, self._actions, self._logprobs, self._advantages, self._returns, self._values])
 
-        # get batch indices
-        assert self._num_envs % self._num_minibatches == 0
-        envsperbatch = self._num_envs // self._num_minibatches
-        envinds = np.arange(self._num_envs)
-        flatinds = np.arange(self._batch_size).reshape(self._num_steps, self._num_envs)
-        clipfracs = []
+            # has to be the same order as below
+            dataset = RecurrentPPODataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+            sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch, False)
+
+        # Non-recurrent approach:
+        # 1. Reshape experience into batch of individual steps
+        # 2. Select batches of steps
+        else:
+            # flatten the data
+            obs_actor = self._obs_actor.reshape((-1, self._obs_size_actor))
+            obs_critic = self._obs_critic.reshape((-1, self._obs_size_critic))
+            actions = self._actions.reshape((-1, self._action_size))
+            logprobs = self._logprobs.reshape(-1)
+            dones = self._dones.reshape(-1)
+            advantages = self._advantages.reshape(-1)
+            returns = self._returns.reshape(-1)
+            values = self._values.reshape(-1)
+
+            # has to be the same order as below
+            dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+            sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch*self._num_steps, False)
 
         # Optimizing the policy and value network
+        clipfracs = []
         for epoch in range(self._update_epochs):
-            np.random.shuffle(envinds)
-            for start in range(0, self._num_envs, envsperbatch):
-                end = start + envsperbatch
-                mbenvinds = envinds[start:end]
-                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
+            for batch_indices in sampler:
+
+                # get batch data
+                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
+                    = dataset[batch_indices]
+                actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
+                critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
 
                 _, newlogprob, entropy, _ = self._actor_critic.get_action(
-                    obs_actor_flat[mb_inds],
-                    initial_actor_state[..., mbenvinds, :],
-                    dones_flat[mb_inds],
-                    actions_flat[mb_inds],
+                    obs_actor_b,
+                    actor_state,
+                    actions_b,
                 )
                 newvalue, _ = self._actor_critic.get_value(
-                    obs__critic_flat[mb_inds],
-                    initial_critic_state[..., mbenvinds, :] if torch.is_tensor(initial_critic_state) else None,
-                    dones_flat[mb_inds],
+                    obs_critic_b,
+                    critic_state,
                 )
-                logratio = newlogprob - logprobs_flat[mb_inds]
+
+                # apply mask to select only unpadded data
+                if self.RECURRENT:
+                    [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy] \
+                        = self.apply_mask(
+                            [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy],
+                            traj_mask[:, batch_indices])
+
+                logratio = newlogprob - logprobs_b
                 ratio = logratio.exp()
 
                 with torch.no_grad():
@@ -197,7 +236,7 @@ class PPO:
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
 
-                mb_advantages = advantages_flat[mb_inds]
+                mb_advantages = advantages_b
                 if self._use_norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
@@ -207,19 +246,20 @@ class PPO:
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
+                # TODO maybe not needed anymore
                 newvalue = newvalue.view(-1)
                 if self._clip_vloss:
-                    v_loss_unclipped = (newvalue - returns_flat[mb_inds]) ** 2
-                    v_clipped = values_flat[mb_inds] + torch.clamp(
-                        newvalue - values_flat[mb_inds],
+                    v_loss_unclipped = (newvalue - returns_b) ** 2
+                    v_clipped = values_b + torch.clamp(
+                        newvalue - values_b,
                         -self._clip_coef,
                         self._clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - returns_flat[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - returns_b) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - returns_flat[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - returns_b) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef
@@ -237,3 +277,142 @@ class PPO:
         self._scheduler.step()
 
         return v_loss, pg_loss, entropy_loss
+
+
+    def split_sequences(self, obs, dones, actor_states, critic_states, tensors):
+        # return split obs, split tensors
+        # and mask to restore tensors
+        # obs dones and tensors should have shape (seq_len, batch_size, ...)
+        
+        # input must be (seq_len, batch_size, obs_size)
+        assert obs.ndim == 3
+        seq_len = obs.shape[0]
+        batch_size = obs.shape[1]
+
+        # SPLIT TRAJECTORIES
+        # clone, as this tensor will be modified
+        split_indices = dones.clone()
+        # force split at the start of trajectory
+        split_indices[0] = 1
+        # transpose and flatten tensors to reorder entries
+        # required later for splitting the observations correctly
+        # for tensor with indices (sequence, batch):
+        #   old shape: [obs(0,0), obs(0,1), ...]
+        #   new shape: [obs(0,0), obs(1,0), ...]
+        # causes data to be copied
+        obs = obs.movedim(0, 1).flatten(0, 1)
+        dones = dones.movedim(0, 1).flatten(0, 1)
+        split_indices = split_indices.movedim(0, 1).flatten(0, 1)
+        # get indices (split requires tensor in CPU)
+        split_indices = torch.argwhere(split_indices).flatten().cpu()
+        # split trajectories at dones or start of trajectory
+        obs_split = list(torch.tensor_split(obs, split_indices, dim=0))
+        # remove first element if empty
+        if obs_split[0].numel() == 0:
+            obs_split = obs_split[1:]
+
+        # REMOVE SHORT TRAJECTORIES
+        # get start and end of each trajectory
+        # for this we need to add the end of last trajectory to split_indices
+        start_end_indices = torch.cat((split_indices, torch.tensor([batch_size*seq_len])))
+        # get original length of each trajectory
+        traj_lengths = torch.diff(start_end_indices)
+        # select trajectories to remove (smaller than x steps)
+        remove_mask = traj_lengths < self._min_seq_size
+        remove_indices = torch.argwhere(remove_mask).flatten()
+        keep_indices = torch.argwhere(torch.logical_not(remove_mask)).flatten()
+        # update trajectory lengths
+        traj_lengths = traj_lengths[keep_indices]
+        # filter trajectories only if needed
+        if torch.any(remove_mask):
+            for index in remove_indices:
+                obs_split.pop(index)
+            assert len(obs_split) > 0
+
+        # OTHER TENSORS
+        # apply same operations as above to the other tensors
+        tensors_split = []
+        for t in tensors:
+            t = t.movedim(0, 1).flatten(0, 1)
+            t_split = list(torch.tensor_split(t, split_indices, dim=0))
+            if t_split[0].numel() == 0:
+                t_split = t_split[1:]
+            if torch.any(remove_mask):
+                for index in remove_indices:
+                    t_split.pop(index)
+                assert len(t_split) > 0
+            tensors_split.append(t_split)
+
+        # GENERATE HIDDEN STATES
+        # get indices of started trajectories
+        # (the ones that have an initial hidden state)
+        started_traj_indices = seq_len*torch.arange(batch_size)
+        # batches corresponding to started trajectories
+        started_traj_batches = torch.argwhere(torch.isin(start_end_indices, started_traj_indices)).flatten()
+        # generate mask for started trajectories that have a done
+        # (these should be discarded)
+        started_done_traj_mask = torch.logical_not(dones[started_traj_indices] > 0.5).cpu()
+        # generate mask for new hidden states only with relevant batches
+        new_batches_mask = torch.isin(keep_indices, started_traj_batches[started_done_traj_mask])
+        # generate mask for hidden states of started trajectories
+        started_batches_mask = torch.isin(started_traj_batches, keep_indices)
+        started_batches_mask = torch.logical_and(started_batches_mask, started_done_traj_mask)
+        # insert existing hidden states of started trajectories
+        h_actor = self._actor_critic.init_hidden(len(obs_split))
+        h_actor[..., new_batches_mask, :] = actor_states[..., started_batches_mask, :]
+        h_critic = self._actor_critic.init_hidden(len(obs_split))
+        h_critic[..., new_batches_mask, :] = critic_states[..., started_batches_mask, :]
+
+        # GENERATE MASK
+        # get mask of valid trajectories
+        traj_mask = traj_lengths > torch.arange(0, seq_len).unsqueeze(1)
+
+        print("Num trajectories before/after split: ", batch_size, "/", len(obs_split))
+
+        return obs_split, traj_mask, h_actor, h_critic, tensors_split
+
+    def apply_mask(self, tensors, mask):
+        """
+        Concatenates tensors
+        """
+        assert isinstance(tensors, list)
+        tensors_full = []
+        for t in tensors:
+            # create array with full size of output
+            # (as if short trajectories were not removed)
+            t_full = torch.zeros(*mask.shape, device=t.device)
+            # flatten dimensions and move data
+            t_full[:t.shape[0]] = t.flatten(1, -1)
+            # apply mask to unpad outputs and join them
+            t_full = t_full.movedim(0, 1)[mask.movedim(0, 1)]
+            tensors_full.append(t_full)
+
+        return tensors_full
+
+
+class PPO(RecurrentPPO):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.RECURRENT = False
+        assert self._actor_critic._recurrent_actor == False
+        assert self._actor_critic._recurrent_critic == False
+
+    def act(self, obs_actor, obs_critic):
+        return super().act(
+            obs_actor=obs_actor,
+            obs_critic=obs_critic,
+            actor_state=None,
+            critic_state=None,
+            dones=None)
+
+    def compute_returns(self, obs_critic, dones):
+        return super().compute_returns(
+            obs_critic=obs_critic,
+            critic_state=None,
+            dones=dones)
+
+    def update(self):
+        return super().update(
+            initial_actor_state=None,
+            initial_critic_state=None)

@@ -12,6 +12,7 @@ class ActorCritic(torch.nn.Module):
             self,
             actor: torch.nn.Module,
             critic: torch.nn.Module,
+            recurrent_actor: bool,
             recurrent_critic: bool,
             actor_output_size: int,
             min_seq_size: int,
@@ -21,6 +22,7 @@ class ActorCritic(torch.nn.Module):
 
         self._actor = actor
         self._critic = critic
+        self._recurrent_actor = recurrent_actor
         self._recurrent_critic = recurrent_critic
         self._actor_output_size = actor_output_size
         self._min_seq_size = min_seq_size
@@ -48,6 +50,7 @@ class ActorCritic(torch.nn.Module):
         a problem if input contains many small trajectories. For this reason,
         trajectories shorter than `_min_seq_size` are removed.
         """
+        assert False
 
         # input must be flattened
         assert obs.ndim == 2
@@ -123,6 +126,7 @@ class ActorCritic(torch.nn.Module):
 
         else:
             # reset hidden states of done envs
+            # TODO KEEP THIS
             hidden_states[..., (dones > 0.5).squeeze(0), :] = 0.
 
         output, hidden_states = model(obs, hidden_states)
@@ -157,6 +161,7 @@ class ActorCritic(torch.nn.Module):
         sequence. This approach is slower than the one in `_process_sequence`,
         but has a smaller memory footprint.
         """
+        assert False
         # unflatten the first dimension
         batch_size = hidden_states.shape[-2]
         obs = obs.reshape(-1, batch_size, *obs.shape[1:])
@@ -174,20 +179,36 @@ class ActorCritic(torch.nn.Module):
         outputs = torch.flatten(torch.cat(outputs), 0, 1)
         return outputs, hidden_states
 
-    def get_value(self, obs, hidden_states, dones):
-        if self._recurrent_critic:
+    def get_action(self, obs, hidden_states, action=None):
+        if self._recurrent_actor:
             assert hidden_states != None
-            value, hidden_states = self._process_sequence(self._critic, obs, hidden_states, dones)
+            action_mean, hidden_states = self._actor(obs, hidden_states)
         else:
-            value = self._critic(obs)
-        return value, hidden_states
+            action_mean = self._actor(obs)
+            hidden_states = None
 
-    def get_action(self, obs, hidden_states, dones, action=None):
-        action_mean, hidden_states = self._process_sequence(self._actor, obs, hidden_states, dones)
         probs = torch.distributions.Normal(action_mean, torch.exp(self._log_std))
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), hidden_states
+        return action, probs.log_prob(action).sum(-1), probs.entropy().sum(-1), hidden_states
+
+    def get_value(self, obs, hidden_states):
+        if self._recurrent_critic:
+            assert hidden_states != None
+            value, hidden_states = self._critic(obs, hidden_states)
+        else:
+            value = self._critic(obs)
+            hidden_states = None
+        return value, hidden_states
+
+    def get_action_inference(self, obs, hidden_states):
+        if self._recurrent_actor:
+            assert hidden_states != None
+            action, hidden_states = self._actor(obs, hidden_states)
+        else:
+            action = self._actor(obs)
+            hidden_states = None
+        return action, hidden_states
 
     def init_hidden(self, batch_size=None):
         return self._actor.init_hidden(batch_size)
