@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import TensorDataset, BatchSampler, RandomSampler
 
 
-class RecurrentPPO:
+class _RecurrentPPO:
     """
     Implementation of PPO based on:
     https://github.com/vwxyzjn/cleanrl
@@ -57,7 +57,8 @@ class RecurrentPPO:
         max_grad_norm: maximum norm for the gradient clipping
         target_kl: if not None, target KL divergence threshold
         learning_rate_gamma: if not None, multiplicative factor of learning rate decay
-        min_seq_size: minimum length of sequence during training, all shorter sequences are discarted
+        min_seq_size: minimum length of sequence during training, all shorter sequences are discarted.
+            (only used for recurrent PPO).
         """
 
         self._actor_critic = actor_critic
@@ -82,7 +83,7 @@ class RecurrentPPO:
         self._min_seq_size = min_seq_size
         self._device = device
 
-        self.RECURRENT = True
+        self.RECURRENT = None
 
         # batch size for flat trajectories
         self._batch_size = int(self._num_envs * self._num_steps)
@@ -129,8 +130,8 @@ class RecurrentPPO:
         with torch.no_grad():
             value, _ = self._actor_critic.get_value(
                 obs_critic,
-                critic_state,
-            )
+                critic_state)
+
             value = value.reshape(1, -1)
             if self._use_gae:
                 self._advantages = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
@@ -157,133 +158,77 @@ class RecurrentPPO:
                     self._returns[t] = self._rewards[t] + self._gamma * nextnonterminal * next_return
                 self._advantages = self._returns - self._values
 
-    def update(self, initial_actor_state: torch.Tensor, initial_critic_state: Union[None, torch.Tensor]):
+    def _update_step(self, newlogprob, logprobs, advantages, returns, newvalue, values, entropy):
 
-        # Preprocess collected data, create a dataset and specify sampling strategy
-        # Recurrent approach:
-        # 1. Split obs and other collected data into lists of single trajectories
-        #    (split sequences everywhere there's a done)
-        # 2. Select random trajectories and build batches of size `num_traj_minibatch`
-        # 3. Get a batch of trajectories and join them by padding the trajectories
-        # 4. After inference, apply mask to output to select only valid (non-padded) steps
-        # Benefits of this approach:
-        # - Faster inference, as we don't have to iterate over individual steps
-        # - Memory usage is limited to size of `num_traj_minibatch*num_steps`
-        #   (upper bound, as collected trajectories can be smaller)
-        if self.RECURRENT:
-            obs_actor, traj_mask, initial_actor_state, initial_critic_state,\
-            [obs_critic, actions, logprobs, advantages, returns, values] \
-                = self.split_sequences(
-                    self._obs_actor, self._dones, initial_actor_state, initial_critic_state,
-                    [self._obs_critic, self._actions, self._logprobs, self._advantages, self._returns, self._values])
+        logratio = newlogprob - logprobs
+        ratio = logratio.exp()
 
-            # has to be the same order as below
-            dataset = RecurrentPPODataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
-            sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch, False)
+        with torch.no_grad():
+            # calculate approx_kl http://joschu.net/blog/kl-approx.html
+            old_approx_kl = (-logratio).mean()
+            approx_kl = ((ratio - 1) - logratio).mean()
+            # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
 
-        # Non-recurrent approach:
-        # 1. Reshape experience into batch of individual steps
-        # 2. Select batches of steps
+        if self._use_norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Policy loss
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
+        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+        # Value loss
+        newvalue = newvalue.view(-1)
+        if self._clip_vloss:
+            v_loss_unclipped = (newvalue - returns) ** 2
+            v_clipped = values + torch.clamp(
+                newvalue - values,
+                -self._clip_coef,
+                self._clip_coef,
+            )
+            v_loss_clipped = (v_clipped - returns) ** 2
+            v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+            v_loss = 0.5 * v_loss_max.mean()
         else:
-            # flatten the data
-            obs_actor = self._obs_actor.reshape((-1, self._obs_size_actor))
-            obs_critic = self._obs_critic.reshape((-1, self._obs_size_critic))
-            actions = self._actions.reshape((-1, self._action_size))
-            logprobs = self._logprobs.reshape(-1)
-            dones = self._dones.reshape(-1)
-            advantages = self._advantages.reshape(-1)
-            returns = self._returns.reshape(-1)
-            values = self._values.reshape(-1)
+            v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
 
-            # has to be the same order as below
-            dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
-            sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch*self._num_steps, False)
+        entropy_loss = entropy.mean()
+        loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef
 
-        # Optimizing the policy and value network
-        clipfracs = []
-        for epoch in range(self._update_epochs):
-            for batch_indices in sampler:
+        self._optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
+        self._optimizer.step()
 
-                # get batch data
-                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
-                    = dataset[batch_indices]
-                actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
-                critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
-
-                _, newlogprob, entropy, _ = self._actor_critic.get_action(
-                    obs_actor_b,
-                    actor_state,
-                    actions_b,
-                )
-                newvalue, _ = self._actor_critic.get_value(
-                    obs_critic_b,
-                    critic_state,
-                )
-
-                # apply mask to select only unpadded data
-                if self.RECURRENT:
-                    [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy] \
-                        = self.apply_mask(
-                            [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy],
-                            traj_mask[:, batch_indices])
-
-                logratio = newlogprob - logprobs_b
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
-
-                mb_advantages = advantages_b
-                if self._use_norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                # TODO maybe not needed anymore
-                newvalue = newvalue.view(-1)
-                if self._clip_vloss:
-                    v_loss_unclipped = (newvalue - returns_b) ** 2
-                    v_clipped = values_b + torch.clamp(
-                        newvalue - values_b,
-                        -self._clip_coef,
-                        self._clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - returns_b) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - returns_b) ** 2).mean()
-
-                entropy_loss = entropy.mean()
-                loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef
-
-                self._optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
-                self._optimizer.step()
-
-            if self._target_kl is not None and approx_kl > self._target_kl:
-                break
-
-        # reset storage
-        self._init_storage()
-        self._scheduler.step()
-
-        return v_loss, pg_loss, entropy_loss
+        return v_loss, pg_loss, entropy_loss, approx_kl
 
 
     def split_sequences(self, obs, dones, actor_states, critic_states, tensors):
-        # return split obs, split tensors
-        # and mask to restore tensors
-        # obs dones and tensors should have shape (seq_len, batch_size, ...)
-        
+        """
+        Splits a batch of sequences containing several trajectories into several
+        sequences that contain only one trajectory.
+        This is accomplished by splitting the input sequence everywhere where
+        there's a done.
+
+        Original sequences: [[a1, a2, a3, a4 | a5, a6],
+                             [b1, b2 | b3, b4, b5 | b6]]
+
+        Split sequences:    [[a1, a2, a3, a4],
+                             [a5, a6],
+                             [b1, b2],
+                             [b3, b4, b5],
+                             [b6]]
+
+        These split sequences can be then joined together into a batch by
+        padding them. This enables a computationally efficient way to process
+        entire batches of sequences, without having to iterate over the
+        individual steps.
+
+        Attention: this method can lead to very large batch sizes. This becomes
+        a problem if input contains many small trajectories. For this reason,
+        trajectories shorter than `_min_seq_size` are removed.
+        """
+
         # input must be (seq_len, batch_size, obs_size)
         assert obs.ndim == 3
         seq_len = obs.shape[0]
@@ -325,8 +270,9 @@ class RecurrentPPO:
         traj_lengths = traj_lengths[keep_indices]
         # filter trajectories only if needed
         if torch.any(remove_mask):
-            for index in remove_indices:
-                obs_split.pop(index)
+            # reverse indices otherwise only the first index is correctly removed
+            for index in reversed(remove_indices):
+                del obs_split[index]
             assert len(obs_split) > 0
 
         # OTHER TENSORS
@@ -338,8 +284,9 @@ class RecurrentPPO:
             if t_split[0].numel() == 0:
                 t_split = t_split[1:]
             if torch.any(remove_mask):
-                for index in remove_indices:
-                    t_split.pop(index)
+                # reverse indices otherwise only the first index is correctly removed
+                for index in reversed(remove_indices):
+                    del t_split[index]
                 assert len(t_split) > 0
             tensors_split.append(t_split)
 
@@ -373,7 +320,7 @@ class RecurrentPPO:
 
     def apply_mask(self, tensors, mask):
         """
-        Concatenates tensors
+        Joins tensors together by selecting only unpadded steps.
         """
         assert isinstance(tensors, list)
         tensors_full = []
@@ -390,7 +337,88 @@ class RecurrentPPO:
         return tensors_full
 
 
-class PPO(RecurrentPPO):
+class RecurrentPPO(_RecurrentPPO):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.RECURRENT = True
+        assert self._actor_critic._recurrent_actor == True or self._actor_critic._recurrent_critic == True
+
+    def update(self, initial_actor_state, initial_critic_state):
+
+        # Preprocess collected data, create a dataset and specify sampling strategy
+        # Recurrent approach:
+        # 1. Split obs and other collected data into lists of single trajectories
+        #    (split sequences everywhere there's a done)
+        # 2. Select random trajectories and build batches of size `num_traj_minibatch`
+        # 3. Get a batch of trajectories and join them by padding the trajectories
+        # 4. After inference, apply mask to output to select only valid (non-padded) steps
+        # Benefits of this approach:
+        # - Faster inference, as we don't have to iterate over individual steps
+        # - Memory footprint is limited to tensor of size `num_traj_minibatch*num_steps`
+        #   (upper bound, as collected trajectories can be smaller)
+        obs_actor, traj_mask, initial_actor_state, initial_critic_state,\
+        [obs_critic, actions, logprobs, advantages, returns, values] \
+            = self.split_sequences(
+                self._obs_actor, self._dones, initial_actor_state, initial_critic_state,
+                [self._obs_critic, self._actions, self._logprobs, self._advantages, self._returns, self._values])
+
+        # has to be the same order as below
+        dataset = RecurrentPPODataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+        sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch, False)
+
+        v_losses = 0.
+        pg_losses = 0.
+        entropy_losses = 0.
+
+        for epoch in range(self._update_epochs):
+            for batch_indices in sampler:
+
+                # get batch data
+                # has to have same order as above
+                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
+                    = dataset[batch_indices]
+                actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
+                critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
+
+                _, newlogprob, entropy, _ = self._actor_critic.get_action(
+                    obs=obs_actor_b,
+                    hidden_states=actor_state,
+                    action=actions_b)
+
+                newvalue, _ = self._actor_critic.get_value(
+                    obs=obs_critic_b,
+                    hidden_states=critic_state)
+
+                # apply mask to select only unpadded data
+                [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy] \
+                    = self.apply_mask(
+                        [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy],
+                        traj_mask[:, batch_indices])
+
+                v_loss, pg_loss, entropy_loss, approx_kl = self._update_step(
+                    newlogprob=newlogprob,
+                    logprobs=logprobs_b,
+                    advantages=advantages_b,
+                    returns=returns_b,
+                    newvalue=newvalue,
+                    values=values_b,
+                    entropy=entropy)
+
+                v_losses += v_loss.item()
+                pg_losses += pg_loss.item()
+                entropy_losses += entropy_loss.item()
+
+            if self._target_kl is not None and approx_kl > self._target_kl:
+                break
+
+        # reset storage
+        self._init_storage()
+        self._scheduler.step()
+
+        return v_losses, pg_losses, entropy_losses
+
+class PPO(_RecurrentPPO):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -399,12 +427,12 @@ class PPO(RecurrentPPO):
         assert self._actor_critic._recurrent_critic == False
 
     def act(self, obs_actor, obs_critic):
-        return super().act(
+        actions, logprobs, values, _, _ = super().act(
             obs_actor=obs_actor,
             obs_critic=obs_critic,
             actor_state=None,
-            critic_state=None,
-            dones=None)
+            critic_state=None)
+        return actions, logprobs, values
 
     def compute_returns(self, obs_critic, dones):
         return super().compute_returns(
@@ -413,6 +441,63 @@ class PPO(RecurrentPPO):
             dones=dones)
 
     def update(self):
-        return super().update(
-            initial_actor_state=None,
-            initial_critic_state=None)
+
+        # Non-recurrent approach:
+        # 1. Reshape experience into batch of individual steps
+        # 2. Select batches of steps
+        # flatten the data
+        obs_actor = self._obs_actor.reshape((-1, self._obs_size_actor))
+        obs_critic = self._obs_critic.reshape((-1, self._obs_size_critic))
+        actions = self._actions.reshape((-1, self._action_size))
+        logprobs = self._logprobs.reshape(-1)
+        dones = self._dones.reshape(-1)
+        advantages = self._advantages.reshape(-1)
+        returns = self._returns.reshape(-1)
+        values = self._values.reshape(-1)
+
+        # has to be the same order as below
+        dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+        sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch*self._num_steps, False)
+
+        v_losses = 0.
+        pg_losses = 0.
+        entropy_losses = 0.
+
+        for epoch in range(self._update_epochs):
+            for batch_indices in sampler:
+
+                # get batch data
+                # has to have same order as above
+                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
+                    = dataset[batch_indices]
+
+                _, newlogprob, entropy, _ = self._actor_critic.get_action(
+                    obs=obs_actor_b,
+                    hidden_states=None,
+                    action=actions_b)
+
+                newvalue, _ = self._actor_critic.get_value(
+                    obs=obs_critic_b,
+                    hidden_states=None)
+
+                v_loss, pg_loss, entropy_loss, approx_kl = self._update_step(
+                    newlogprob=newlogprob,
+                    logprobs=logprobs_b,
+                    advantages=advantages_b,
+                    returns=returns_b,
+                    newvalue=newvalue,
+                    values=values_b,
+                    entropy=entropy)
+
+                v_losses += v_loss.item()
+                pg_losses += pg_loss.item()
+                entropy_losses += entropy_loss.item()
+
+            if self._target_kl is not None and approx_kl > self._target_kl:
+                break
+
+        # reset storage
+        self._init_storage()
+        self._scheduler.step()
+
+        return v_losses, pg_losses, entropy_losses

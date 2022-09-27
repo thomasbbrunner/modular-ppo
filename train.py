@@ -5,10 +5,10 @@ import gym
 import numpy as np
 import torch
 
-from ppo import RecurrentPPO, ActorCritic
+from ppo import PPO, ActorCritic
 
 
-class RNN(torch.nn.Module):
+class MLP(torch.nn.Module):
     def __init__(
             self,
             input_size: int,
@@ -18,24 +18,11 @@ class RNN(torch.nn.Module):
 
         activation = torch.nn.LeakyReLU
         hidden_size = 64
-        self._rnn_hidden_size = 5
-        self._num_layers = 2
-        self._device = device
 
-        self._mlp1 = torch.nn.Sequential(
+        self._model = torch.nn.Sequential(
             torch.nn.Linear(input_size, hidden_size),
             activation(),
             torch.nn.Linear(hidden_size, hidden_size),
-            activation(),
-            torch.nn.Linear(hidden_size, self._rnn_hidden_size))
-
-        self._rnn = torch.nn.GRU(
-            input_size=self._rnn_hidden_size,
-            hidden_size=self._rnn_hidden_size,
-            num_layers=self._num_layers)
-
-        self._mlp2 = torch.nn.Sequential(
-            torch.nn.Linear(self._rnn_hidden_size, hidden_size),
             activation(),
             torch.nn.Linear(hidden_size, hidden_size),
             activation(),
@@ -48,39 +35,16 @@ class RNN(torch.nn.Module):
         # initialization as described in: 
         # https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/
         for layer in self.modules():
-            if isinstance(layer, torch.nn.Linear):
-                # use orthogonal initialization for weights
-                torch.nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-                # set biases to zero
-                torch.nn.init.zeros_(layer.bias)
-            elif isinstance(layer, torch.nn.GRU):
-                for name, param in layer.named_parameters():
-                    if "weight" in name:
-                        torch.nn.init.orthogonal_(param, 1.0)
-                    elif "bias" in name:
-                        torch.nn.init.zeros_(param)
+            if not isinstance(layer, torch.nn.Linear):
+                continue
+            # use orthogonal initialization for weights
+            torch.nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+            # set biases to zero
+            torch.nn.init.zeros_(layer.bias)
 
-    def forward(self, input, hidden):
-
-        # include sequence dimension if not present
-        added_seq_dim = False
-        if input.ndim == 2:
-            input = input[None, ...]
-            added_seq_dim = True
-
-        output = self._mlp1(input)
-        output, hidden = self._rnn(output, hidden)
-        output = self._mlp2(output)
-
-        # remove sequence length dimension only if it was not present
-        if added_seq_dim:
-            output = torch.squeeze(output, dim=0)
-
-        return output, hidden
-
-    def init_hidden(self, batch_size):
-        shape = ((self._num_layers, batch_size, self._rnn_hidden_size))
-        return torch.zeros(shape, device=self._device)
+    def forward(self, input):
+        output = self._model(input)
+        return output
 
 
 class DiscreteActions(gym.ActionWrapper):
@@ -93,7 +57,6 @@ class DiscreteActions(gym.ActionWrapper):
 
 
 def eval(eval_env, agent, render=False):
-    eval_hidden = agent.init_hidden(1)
     eval_obs = eval_env.reset()
     eval_obs = torch.from_numpy(eval_obs[..., :observation_space]).to(device)
 
@@ -101,7 +64,7 @@ def eval(eval_env, agent, render=False):
     eval_reward = 0.
     with torch.inference_mode():
         while True:
-            action, eval_hidden = agent.get_action_inference(eval_obs.unsqueeze(0).unsqueeze(0), eval_hidden)
+            action, _ = agent.get_action_inference(eval_obs.unsqueeze(0).unsqueeze(0), None)
             eval_obs, reward, done, info = eval_env.step(action[0, 0].cpu().numpy())
             if render:
                 eval_env.render()
@@ -147,12 +110,12 @@ if __name__ == "__main__":
     eval_env.seed(seed)
 
     # networks
-    actor_model = RNN(
+    actor_model = MLP(
         input_size=observation_space,
         output_size=action_space,
         device=device)
 
-    critic_model = RNN(
+    critic_model = MLP(
         input_size=observation_space,
         output_size=1,
         device=device)
@@ -160,13 +123,13 @@ if __name__ == "__main__":
     agent = ActorCritic(
         actor=actor_model, 
         critic=critic_model,
-        recurrent_actor=True,
-        recurrent_critic=True,
+        recurrent_actor=False,
+        recurrent_critic=False,
         actor_output_size=action_space,
         device=device)
 
     # PPO
-    ppo = RecurrentPPO(
+    ppo = PPO(
         actor_critic=agent,
         num_steps=num_steps,
         num_envs=num_envs,
@@ -187,41 +150,32 @@ if __name__ == "__main__":
         max_grad_norm=0.5,
         target_kl=0.01,
         learning_rate_gamma=0.999,
-        min_seq_size=2,
+        min_seq_size=None,
         device=device)
 
     global_step = 0
     eval_rewards = []
     next_obs = torch.tensor(envs.reset()).to(device)
     next_dones = torch.zeros(num_envs).to(device)
-    actor_state = agent.init_hidden(num_envs)
-    critic_state = agent.init_hidden(num_envs)
 
     for update in range(1, num_updates + 1):
-        initial_actor_state = actor_state.clone()
-        initial_critic_state = critic_state.clone()
-
         for step in range(0, num_steps):
             global_step += 1 * num_envs
             obs = next_obs
             dones = next_dones
 
-            actions, logprobs, values, actor_state, critic_state = ppo.act(obs, obs, actor_state, critic_state)
+            actions, logprobs, values = ppo.act(obs, obs)
             next_obs, rewards, next_dones, info = envs.step(actions.cpu().numpy())
 
             next_obs = torch.tensor(next_obs).to(device)
             rewards = torch.tensor(rewards).to(device)
             next_dones = torch.tensor(next_dones).to(device)
 
-            # reset hidden states of dones
-            actor_state[..., next_dones > 0.5, :] = 0.
-            critic_state[..., next_dones > 0.5, :] = 0.
-
             ppo.set_step(obs, obs, actions, logprobs, rewards, dones, values)
 
-        ppo.compute_returns(next_obs, critic_state, next_dones)
+        ppo.compute_returns(next_obs, next_dones)
 
-        v_loss, pg_loss, entropy_loss = ppo.update(initial_actor_state, initial_critic_state)
+        v_loss, pg_loss, entropy_loss = ppo.update()
 
         agent.clamp_std(0.2, 3.0)
 
