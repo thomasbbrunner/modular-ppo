@@ -239,6 +239,9 @@ class PPO:
             advantages = self._advantages.reshape(-1)
             returns = self._returns.reshape(-1)
             values = self._values.reshape(-1)
+            # force states to None
+            initial_actor_state = None
+            initial_critic_state = None
 
             # has to be the same order as below
             dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
