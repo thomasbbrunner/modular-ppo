@@ -305,10 +305,14 @@ class _RecurrentPPO:
         started_batches_mask = torch.isin(started_traj_batches, keep_indices)
         started_batches_mask = torch.logical_and(started_batches_mask, started_done_traj_mask)
         # insert existing hidden states of started trajectories
-        h_actor = self._actor_critic.init_hidden(len(obs_split))
-        h_actor[..., new_batches_mask, :] = actor_states[..., started_batches_mask, :]
-        h_critic = self._actor_critic.init_hidden(len(obs_split))
-        h_critic[..., new_batches_mask, :] = critic_states[..., started_batches_mask, :]
+        if actor_states != None:
+            h_actor = self._actor_critic.init_hidden(len(obs_split))
+            h_actor[..., new_batches_mask, :] = actor_states[..., started_batches_mask, :]
+            actor_states = h_actor
+        if critic_states != None:
+            h_critic = self._actor_critic.init_hidden(len(obs_split))
+            h_critic[..., new_batches_mask, :] = critic_states[..., started_batches_mask, :]
+            critic_states = h_critic
 
         # GENERATE MASK
         # get mask of valid trajectories
@@ -316,7 +320,7 @@ class _RecurrentPPO:
 
         print("Num trajectories before/after split: ", batch_size, "/", len(obs_split))
 
-        return obs_split, traj_mask, h_actor, h_critic, tensors_split
+        return obs_split, traj_mask, actor_states, critic_states, tensors_split
 
     def apply_mask(self, tensors, mask):
         """
@@ -378,7 +382,7 @@ class RecurrentPPO(_RecurrentPPO):
                 # has to have same order as above
                 obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
                     = dataset[batch_indices]
-                actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
+                actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_actor_state) else None
                 critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
 
                 _, newlogprob, entropy, _ = self._actor_critic.get_action(
