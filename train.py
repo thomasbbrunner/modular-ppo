@@ -131,6 +131,7 @@ if __name__ == "__main__":
     # PPO
     ppo = PPO(
         actor_critic=agent,
+        recurrent=False,
         num_steps=num_steps,
         num_envs=num_envs,
         obs_size_actor=observation_space,
@@ -164,7 +165,7 @@ if __name__ == "__main__":
             obs = next_obs
             dones = next_dones
 
-            actions, logprobs, values = ppo.act(obs, obs)
+            actions, logprobs, values, _, _ = ppo.act(obs, obs)
             next_obs, rewards, next_dones, info = envs.step(actions.cpu().numpy())
 
             next_obs = torch.tensor(next_obs).to(device)

@@ -5,7 +5,7 @@ import gym
 import numpy as np
 import torch
 
-from ppo import RecurrentPPO, ActorCritic
+from ppo import PPO, ActorCritic
 
 
 class RNN(torch.nn.Module):
@@ -166,8 +166,9 @@ if __name__ == "__main__":
         device=device)
 
     # PPO
-    ppo = RecurrentPPO(
+    ppo = PPO(
         actor_critic=agent,
+        recurrent=True,
         num_steps=num_steps,
         num_envs=num_envs,
         obs_size_actor=observation_space,
@@ -219,7 +220,7 @@ if __name__ == "__main__":
 
             ppo.set_step(obs, obs, actions, logprobs, rewards, dones, values)
 
-        ppo.compute_returns(next_obs, critic_state, next_dones)
+        ppo.compute_returns(next_obs, next_dones, critic_state)
 
         v_loss, pg_loss, entropy_loss = ppo.update(initial_actor_state, initial_critic_state)
 
