@@ -70,3 +70,7 @@ class ActorCritic(torch.nn.Module):
     @property
     def policy(self):
         return copy.deepcopy(self._actor)
+
+    @property
+    def log_std(self):
+        return self._log_std

@@ -93,10 +93,8 @@ class PPO:
         self._optimizer = torch.optim.Adam(self._actor_critic.parameters(), lr=self._learning_rate, eps=1e-5)
         self._scheduler = torch.optim.lr_scheduler.ExponentialLR(self._optimizer, learning_rate_gamma, last_epoch=-1, verbose=True)
 
-        self._init_storage()
-
-    def _init_storage(self):
-        # storage setup
+        # storage
+        # TODO add option to save collected info in cpu and then transfer only batches to GPU during training
         self._obs_actor = torch.zeros((self._num_steps, self._num_envs, self._obs_size_actor)).to(self._device)
         self._obs_critic = torch.zeros((self._num_steps, self._num_envs, self._obs_size_critic)).to(self._device)
         self._actions = torch.zeros((self._num_steps, self._num_envs, self._action_size)).to(self._device)
@@ -106,6 +104,18 @@ class PPO:
         self._values = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._advantages = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
         self._returns = torch.zeros((self._num_steps, self._num_envs)).to(self._device)
+        self._step = 0
+
+    def _reset_storage(self):
+        self._obs_actor[:] = 0.
+        self._obs_critic[:] = 0.
+        self._actions[:] = 0.
+        self._logprobs[:] = 0.
+        self._rewards[:] = 0.
+        self._dones[:] = 0.
+        self._values[:] = 0.
+        self._advantages[:] = 0.
+        self._returns[:] = 0.
         self._step = 0
 
     def act(self, obs_actor, obs_critic, actor_state=None, critic_state=None):
@@ -201,7 +211,7 @@ class PPO:
         torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
         self._optimizer.step()
 
-        return v_loss, pg_loss, entropy_loss, approx_kl
+        return loss, v_loss, pg_loss, entropy_loss, approx_kl
 
     def update(self, initial_actor_state=None, initial_critic_state=None):
 
@@ -247,6 +257,7 @@ class PPO:
             dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
             sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch*self._num_steps, False)
 
+        losses = 0.
         v_losses = 0.
         pg_losses = 0.
         entropy_losses = 0.
@@ -277,7 +288,7 @@ class PPO:
                             [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy],
                             traj_mask[:, batch_indices])
 
-                v_loss, pg_loss, entropy_loss, approx_kl = self._update_step(
+                loss, v_loss, pg_loss, entropy_loss, approx_kl = self._update_step(
                     newlogprob=newlogprob,
                     logprobs=logprobs_b,
                     advantages=advantages_b,
@@ -286,6 +297,7 @@ class PPO:
                     values=values_b,
                     entropy=entropy)
 
+                losses += loss.item()
                 v_losses += v_loss.item()
                 pg_losses += pg_loss.item()
                 entropy_losses += entropy_loss.item()
@@ -294,10 +306,10 @@ class PPO:
                 break
 
         # reset storage
-        self._init_storage()
+        self._reset_storage()
         self._scheduler.step()
 
-        return v_losses, pg_losses, entropy_losses
+        return losses, v_losses, pg_losses, entropy_losses
 
 
     def split_sequences(self, obs, dones, actor_states, critic_states, tensors):
@@ -436,3 +448,12 @@ class PPO:
             tensors_full.append(t_full)
 
         return tensors_full
+
+    def state_dict(self):
+        return {
+            "optimizer": self._optimizer.state_dict(),
+            "scheduler": self._scheduler.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self._optimizer.load_state_dict(state_dict["optimizer"])
+        self._scheduler.load_state_dict(state_dict["scheduler"])

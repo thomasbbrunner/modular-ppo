@@ -222,12 +222,13 @@ if __name__ == "__main__":
 
         ppo.compute_returns(next_obs, next_dones, critic_state)
 
-        v_loss, pg_loss, entropy_loss = ppo.update(initial_actor_state, initial_critic_state)
+        loss, v_loss, pg_loss, entropy_loss = ppo.update(initial_actor_state, initial_critic_state)
 
         agent.clamp_std(0.2, 3.0)
 
         print("Iter ", update)
         print("Total steps ", global_step)
+        print("Total loss ", loss)
         print("Value loss ", v_loss)
         print("Policy loss ", pg_loss)
         print("Entropy loss ", entropy_loss)
