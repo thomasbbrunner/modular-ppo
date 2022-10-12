@@ -131,9 +131,9 @@ class PPO:
         self._obs_actor[self._step] = obs_actor
         self._obs_critic[self._step] = obs_critic
         self._actions[self._step] = actions
-        self._logprobs[self._step] = logprobs
-        self._rewards[self._step] = rewards
-        self._dones[self._step] = dones
+        self._logprobs[self._step] = logprobs.flatten()
+        self._rewards[self._step] = rewards.flatten()
+        self._dones[self._step] = dones.flatten()
         self._values[self._step] = values.flatten()
         # increment step
         self._step += 1
@@ -171,51 +171,7 @@ class PPO:
                     self._returns[t] = self._rewards[t] + self._gamma * nextnonterminal * next_return
                 self._advantages = self._returns - self._values
 
-    def _update_step(self, newlogprob, logprobs, advantages, returns, newvalue, values, entropy):
-
-        logratio = newlogprob - logprobs
-        ratio = logratio.exp()
-
-        with torch.no_grad():
-            # calculate approx_kl http://joschu.net/blog/kl-approx.html
-            old_approx_kl = (-logratio).mean()
-            approx_kl = ((ratio - 1) - logratio).mean()
-            # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
-
-        if self._use_norm_adv:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # Policy loss
-        pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
-        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-        # Value loss
-        newvalue = newvalue.view(-1)
-        if self._clip_vloss:
-            v_loss_unclipped = (newvalue - returns) ** 2
-            v_clipped = values + torch.clamp(
-                newvalue - values,
-                -self._clip_coef,
-                self._clip_coef,
-            )
-            v_loss_clipped = (v_clipped - returns) ** 2
-            v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-            v_loss = 0.5 * v_loss_max.mean()
-        else:
-            v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
-
-        entropy_loss = entropy.mean()
-        loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef
-
-        self._optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
-        self._optimizer.step()
-
-        return loss, v_loss, pg_loss, entropy_loss, approx_kl
-
-    def update(self, initial_actor_state=None, initial_critic_state=None):
+    def update(self, initial_actor_state=None, initial_critic_state=None, calc_extra_loss=None):
 
         # Preprocess collected data, create a dataset and specify sampling strategy
         if self._recurrent:
@@ -241,13 +197,12 @@ class PPO:
         else:
             # Non-recurrent approach:
             # 1. Reshape experience into batch of individual steps
-            # 2. Select batches of steps of size `num_traj_minibatch*num_steps` (approximately
-            #   same number of steps in each batch as the recurrent approach)
+            # 2. Select batches of steps of size `num_traj_minibatch*num_steps`
+            #    (approximately same number of steps in each batch as the recurrent approach)
             obs_actor = self._obs_actor.reshape((-1, self._obs_size_actor))
             obs_critic = self._obs_critic.reshape((-1, self._obs_size_critic))
             actions = self._actions.reshape((-1, self._action_size))
             logprobs = self._logprobs.reshape(-1)
-            dones = self._dones.reshape(-1)
             advantages = self._advantages.reshape(-1)
             returns = self._returns.reshape(-1)
             values = self._values.reshape(-1)
@@ -259,50 +214,98 @@ class PPO:
             dataset = TensorDataset(obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
             sampler = BatchSampler(RandomSampler(dataset), self._num_traj_minibatch*self._num_steps, False)
 
+        # clear variable names to avoid bugs
+        del obs_actor, obs_critic, actions, logprobs, advantages, returns, values
+
         losses = 0.
         v_losses = 0.
         pg_losses = 0.
         entropy_losses = 0.
+        extra_losses = 0.
 
         for epoch in range(self._update_epochs):
             for batch_indices in sampler:
 
                 # get batch data
                 # has to have same order as above
-                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
+                obs_actor, obs_critic, actions, logprobs, advantages, returns, values \
                     = dataset[batch_indices]
                 actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_actor_state) else None
                 critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
 
                 _, newlogprob, entropy, _ = self._actor_critic.get_action(
-                    obs=obs_actor_b,
+                    obs=obs_actor,
                     hidden_states=actor_state,
-                    action=actions_b)
+                    action=actions)
 
                 newvalue, _ = self._actor_critic.get_value(
-                    obs=obs_critic_b,
+                    obs=obs_critic,
                     hidden_states=critic_state)
 
                 if self._recurrent:
                     # apply mask to select only unpadded data
-                    [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy] \
-                        = self.apply_mask(
-                            [newlogprob, logprobs_b, advantages_b, newvalue, returns_b, values_b, entropy],
-                            traj_mask[:, batch_indices])
+                    if calc_extra_loss is not None:
+                        obs_actor = self.apply_mask(obs_actor, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                        obs_critic = self.apply_mask(obs_critic, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                        actions = self.apply_mask(actions, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    logprobs = self.apply_mask(logprobs, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    newlogprob = self.apply_mask(newlogprob, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    advantages = self.apply_mask(advantages, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    returns = self.apply_mask(returns, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    values = self.apply_mask(values, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    newvalue = self.apply_mask(newvalue, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                    entropy = self.apply_mask(entropy, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
 
-                loss, v_loss, pg_loss, entropy_loss, approx_kl = self._update_step(
-                    newlogprob=newlogprob,
-                    logprobs=logprobs_b,
-                    advantages=advantages_b,
-                    returns=returns_b,
-                    newvalue=newvalue,
-                    values=values_b,
-                    entropy=entropy)
+                # extra loss summed to PPO loss
+                if calc_extra_loss is not None:
+                    extra_loss = calc_extra_loss(traj_mask[:, batch_indices], obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+
+                logratio = newlogprob - logprobs
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
+
+                if self._use_norm_adv:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                # Policy loss
+                pg_loss1 = -advantages * ratio
+                pg_loss2 = -advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # Value loss
+                newvalue = newvalue.view(-1)
+                if self._clip_vloss:
+                    v_loss_unclipped = (newvalue - returns) ** 2
+                    v_clipped = values + torch.clamp(
+                        newvalue - values,
+                        -self._clip_coef,
+                        self._clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - returns) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+
+                entropy_loss = entropy.mean()
+                loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef + extra_loss
+
+                self._optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
+                self._optimizer.step()
 
                 losses += loss.item()
                 v_losses += v_loss.item()
                 pg_losses += pg_loss.item()
                 entropy_losses += entropy_loss.item()
+                if calc_extra_loss is not None:
+                    extra_losses += extra_loss.item()
 
             if self._target_kl is not None and approx_kl > self._target_kl:
                 break
@@ -311,7 +314,7 @@ class PPO:
         self._reset_storage()
         self._scheduler.step()
 
-        return losses, v_losses, pg_losses, entropy_losses, self._scheduler.get_last_lr()[0]
+        return losses, v_losses, pg_losses, entropy_losses, extra_losses, self._scheduler.get_last_lr()[0]
 
     def split_sequences(self, obs, dones, actor_states, critic_states, tensors):
         """
@@ -432,23 +435,28 @@ class PPO:
 
         return obs_split, traj_mask, actor_states, critic_states, tensors_split
 
-    def apply_mask(self, tensors, mask):
+    def apply_mask(self, tensor, mask, seq_dim=0, batch_dim=1):
         """
-        Joins tensors together by selecting only unpadded steps.
+        TODO
+        Joins tensors together by selecting only unpadded steps. Result is a
+        flattened tensor of valid steps .
         """
-        assert isinstance(tensors, list)
-        tensors_full = []
-        for t in tensors:
-            # create array with full size of output
-            # (as if short trajectories were not removed)
-            t_full = torch.zeros(*mask.shape, device=t.device)
-            # flatten dimensions and move data
-            t_full[:t.shape[0]] = t.flatten(1, -1)
-            # apply mask to unpad outputs and join them
-            t_full = t_full.movedim(0, 1)[mask.movedim(0, 1)]
-            tensors_full.append(t_full)
-
-        return tensors_full
+        assert seq_dim < batch_dim  # otherwise algorithm does not work
+        # create array with full size of output
+        # (as if short trajectories were not removed)
+        shape = list(tensor.shape)
+        shape[seq_dim] = mask.shape[0]
+        shape[batch_dim] = mask.shape[1]
+        tensor_full = torch.zeros(shape, device=tensor.device)
+        # move data
+        tensor_full = tensor_full.movedim(seq_dim, 0).movedim(batch_dim, 1)
+        tensor = tensor.movedim(seq_dim, 0).movedim(batch_dim, 1)
+        tensor_full[:tensor.shape[0]] = tensor
+        # apply mask to unpad outputs and join them
+        tensor_full = tensor_full.movedim(0, 1)[mask.movedim(0, 1)]
+        # move dimension back
+        tensor_full = tensor_full.movedim(0, seq_dim)
+        return tensor_full
 
     def state_dict(self):
         return {
