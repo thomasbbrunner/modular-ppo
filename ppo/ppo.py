@@ -91,7 +91,9 @@ class PPO:
 
         # optimizer
         self._optimizer = torch.optim.Adam(self._actor_critic.parameters(), lr=self._learning_rate, eps=1e-5)
-        self._scheduler = torch.optim.lr_scheduler.ExponentialLR(self._optimizer, learning_rate_gamma, last_epoch=-1, verbose=True)
+        if learning_rate_gamma is None:
+            learning_rate_gamma = 1
+        self._scheduler = torch.optim.lr_scheduler.ExponentialLR(self._optimizer, learning_rate_gamma, last_epoch=-1)
 
         # storage
         # TODO add option to save collected info in cpu and then transfer only batches to GPU during training
@@ -309,8 +311,7 @@ class PPO:
         self._reset_storage()
         self._scheduler.step()
 
-        return losses, v_losses, pg_losses, entropy_losses
-
+        return losses, v_losses, pg_losses, entropy_losses, self._scheduler.get_last_lr()[0]
 
     def split_sequences(self, obs, dones, actor_states, critic_states, tensors):
         """

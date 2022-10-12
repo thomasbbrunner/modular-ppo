@@ -199,6 +199,7 @@ if __name__ == "__main__":
     critic_state = agent.init_hidden(num_envs)
 
     for update in range(1, num_updates + 1):
+        print("Iter ", update)
         initial_actor_state = actor_state.clone()
         initial_critic_state = critic_state.clone()
 
@@ -222,11 +223,10 @@ if __name__ == "__main__":
 
         ppo.compute_returns(next_obs, next_dones, critic_state)
 
-        loss, v_loss, pg_loss, entropy_loss = ppo.update(initial_actor_state, initial_critic_state)
+        loss, v_loss, pg_loss, entropy_loss, *_ = ppo.update(initial_actor_state, initial_critic_state)
 
         agent.clamp_std(0.2, 3.0)
 
-        print("Iter ", update)
         print("Total steps ", global_step)
         print("Total loss ", loss)
         print("Value loss ", v_loss)
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         print("Entropy loss ", entropy_loss)
 
         # evaluate
-        if update % 10 == 0:
+        if update % 1 == 0:
             eval_rewards.append(eval(eval_env, agent, render=False))
 
     envs.close()

@@ -160,6 +160,8 @@ if __name__ == "__main__":
     next_dones = torch.zeros(num_envs).to(device)
 
     for update in range(1, num_updates + 1):
+        print("Iter ", update)
+
         for step in range(0, num_steps):
             global_step += 1 * num_envs
             obs = next_obs
@@ -176,11 +178,10 @@ if __name__ == "__main__":
 
         ppo.compute_returns(next_obs, next_dones)
 
-        loss, v_loss, pg_loss, entropy_loss = ppo.update()
+        loss, v_loss, pg_loss, entropy_loss, *_ = ppo.update()
 
         agent.clamp_std(0.2, 3.0)
 
-        print("Iter ", update)
         print("Total steps ", global_step)
         print("Total loss ", loss)
         print("Value loss ", v_loss)
@@ -188,7 +189,7 @@ if __name__ == "__main__":
         print("Entropy loss ", entropy_loss)
 
         # evaluate
-        if update % 10 == 0:
+        if update % 1 == 0:
             eval_rewards.append(eval(eval_env, agent, render=False))
 
     envs.close()
