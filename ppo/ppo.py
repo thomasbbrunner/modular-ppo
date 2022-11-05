@@ -24,6 +24,7 @@ class PPO:
         action_size: int,
         learning_rate: float,
         num_traj_minibatch: int,
+        bptt_len: int,
         update_epochs: int,
         use_gae: bool,
         gae_lambda: float,
@@ -47,6 +48,7 @@ class PPO:
         action_size: shape of output of actor
         learning_rate: learning rate of the optimizer
         num_traj_minibatch: number of trajectories in each minibatch during update
+        bptt_len: number of steps to consider when calculating loss using bptt
         update_epochs: number of epochs to update the policy
         use_gae: use GAE for advantage computation
         gae_lambda: lambda for the general advantage estimation
@@ -72,6 +74,7 @@ class PPO:
         self._action_size = action_size
         self._learning_rate = learning_rate
         self._num_traj_minibatch = num_traj_minibatch
+        self._bptt_len = bptt_len
         self._update_epochs = update_epochs
         self._use_gae = use_gae
         self._gae_lambda = gae_lambda
@@ -85,6 +88,10 @@ class PPO:
         self._target_kl = target_kl
         self._min_seq_size = min_seq_size
         self._device = device
+
+        # ignore bptt parameter if using non-recurrent PPO
+        if not self._recurrent:
+            self._bptt_len = self._num_steps
 
         # batch size for flat trajectories
         self._batch_size = int(self._num_envs * self._num_steps)
@@ -228,84 +235,109 @@ class PPO:
 
                 # get batch data
                 # has to have same order as above
-                obs_actor, obs_critic, actions, logprobs, advantages, returns, values \
+                obs_actor_b, obs_critic_b, actions_b, logprobs_b, advantages_b, returns_b, values_b \
                     = dataset[batch_indices]
                 actor_state = initial_actor_state[..., batch_indices, :] if torch.is_tensor(initial_actor_state) else None
                 critic_state = initial_critic_state[..., batch_indices, :] if torch.is_tensor(initial_critic_state) else None
 
-                _, newlogprob, entropy, _ = self._actor_critic.get_action(
-                    obs=obs_actor,
-                    hidden_states=actor_state,
-                    action=actions)
+                for subseq_index in range(self._num_steps//self._bptt_len):
+                    if self._recurrent:
+                        start_step = subseq_index*self._bptt_len
+                        end_step = (subseq_index+1)*self._bptt_len
+                        # stop if batch sequence size is reached
+                        if start_step >= obs_actor_b.shape[0]:
+                            break
+                    else:
+                        start_step = 0
+                        end_step = -1
 
-                newvalue, _ = self._actor_critic.get_value(
-                    obs=obs_critic,
-                    hidden_states=critic_state)
+                    obs_actor = obs_actor_b[..., start_step:end_step, :, :]
+                    obs_critic = obs_critic_b[..., start_step:end_step, :, :]
+                    actions = actions_b[..., start_step:end_step, :, :]
+                    logprobs = logprobs_b[..., start_step:end_step, :]
+                    advantages = advantages_b[..., start_step:end_step, :]
+                    returns = returns_b[..., start_step:end_step, :]
+                    values = values_b[..., start_step:end_step, :]
+                    traj_mask_sub = traj_mask[start_step:end_step, batch_indices]
 
-                if self._recurrent:
-                    # apply mask to select only unpadded data
+                    _, newlogprob, entropy, actor_state = self._actor_critic.get_action(
+                        obs=obs_actor,
+                        hidden_states=actor_state,
+                        action=actions)
+
+                    newvalue, critic_state = self._actor_critic.get_value(
+                        obs=obs_critic,
+                        hidden_states=critic_state)
+
+                    if self._recurrent:
+                        # apply mask to select only unpadded data
+                        if calc_extra_loss is not None:
+                            obs_actor = self.apply_mask(obs_actor, traj_mask_sub, seq_dim=0, batch_dim=1)
+                            obs_critic = self.apply_mask(obs_critic, traj_mask_sub, seq_dim=0, batch_dim=1)
+                            actions = self.apply_mask(actions, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        logprobs = self.apply_mask(logprobs, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        newlogprob = self.apply_mask(newlogprob, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        advantages = self.apply_mask(advantages, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        returns = self.apply_mask(returns, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        values = self.apply_mask(values, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        newvalue = self.apply_mask(newvalue, traj_mask_sub, seq_dim=0, batch_dim=1)
+                        entropy = self.apply_mask(entropy, traj_mask_sub, seq_dim=0, batch_dim=1)
+
+                    # extra loss summed to PPO loss
                     if calc_extra_loss is not None:
-                        obs_actor = self.apply_mask(obs_actor, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                        obs_critic = self.apply_mask(obs_critic, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                        actions = self.apply_mask(actions, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    logprobs = self.apply_mask(logprobs, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    newlogprob = self.apply_mask(newlogprob, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    advantages = self.apply_mask(advantages, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    returns = self.apply_mask(returns, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    values = self.apply_mask(values, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    newvalue = self.apply_mask(newvalue, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
-                    entropy = self.apply_mask(entropy, traj_mask[:, batch_indices], seq_dim=0, batch_dim=1)
+                        extra_loss = calc_extra_loss(traj_mask_sub, obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+                    else:
+                        extra_loss = 0.
 
-                # extra loss summed to PPO loss
-                if calc_extra_loss is not None:
-                    extra_loss = calc_extra_loss(traj_mask[:, batch_indices], obs_actor, obs_critic, actions, logprobs, advantages, returns, values)
+                    logratio = newlogprob - logprobs
+                    ratio = logratio.exp()
 
-                logratio = newlogprob - logprobs
-                ratio = logratio.exp()
+                    with torch.no_grad():
+                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
 
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
+                    if self._use_norm_adv:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                if self._use_norm_adv:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    # Policy loss
+                    pg_loss1 = -advantages * ratio
+                    pg_loss2 = -advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Policy loss
-                pg_loss1 = -advantages * ratio
-                pg_loss2 = -advantages * torch.clamp(ratio, 1 - self._clip_coef, 1 + self._clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    # Value loss
+                    newvalue = newvalue.view(-1)
+                    if self._clip_vloss:
+                        v_loss_unclipped = (newvalue - returns) ** 2
+                        v_clipped = values + torch.clamp(
+                            newvalue - values,
+                            -self._clip_coef,
+                            self._clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - returns) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = 0.5 * v_loss_max.mean()
+                    else:
+                        v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
 
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if self._clip_vloss:
-                    v_loss_unclipped = (newvalue - returns) ** 2
-                    v_clipped = values + torch.clamp(
-                        newvalue - values,
-                        -self._clip_coef,
-                        self._clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - returns) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef + extra_loss
 
-                entropy_loss = entropy.mean()
-                loss = pg_loss - self._ent_coef * entropy_loss + v_loss * self._vf_coef + extra_loss
+                    self._optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
+                    self._optimizer.step()
+                    # detach tensors that we want to use in the next iteration
+                    actor_state = actor_state.detach() if torch.is_tensor(actor_state) else None
+                    critic_state = critic_state.detach() if torch.is_tensor(critic_state) else None
 
-                self._optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._actor_critic.parameters(), self._max_grad_norm)
-                self._optimizer.step()
-
-                losses += loss.item()
-                v_losses += v_loss.item()
-                pg_losses += pg_loss.item()
-                entropy_losses += entropy_loss.item()
-                if calc_extra_loss is not None:
-                    extra_losses += extra_loss.item()
+                    losses += loss.item()
+                    v_losses += v_loss.item()
+                    pg_losses += pg_loss.item()
+                    entropy_losses += entropy_loss.item()
+                    if calc_extra_loss is not None:
+                        extra_losses += extra_loss.item()
 
             if self._target_kl is not None and approx_kl > self._target_kl:
                 break

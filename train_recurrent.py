@@ -126,6 +126,7 @@ if __name__ == "__main__":
     num_envs = 200
     num_steps = 500
     num_traj_minibatch = 200
+    bptt_len = 500
     device = "cuda"
 
     random.seed(seed)
@@ -176,6 +177,7 @@ if __name__ == "__main__":
         action_size=action_space,
         learning_rate=3e-4,
         num_traj_minibatch=num_traj_minibatch,
+        bptt_len=bptt_len,
         update_epochs=4,
         use_gae=True,
         gae_lambda=0.95,
