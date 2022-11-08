@@ -244,7 +244,7 @@ class PPO:
                     if self._recurrent:
                         start_step = subseq_index*self._bptt_len
                         end_step = (subseq_index+1)*self._bptt_len
-                        # stop if batch sequence size is reached
+                        # stop if sequence size of batch is reached
                         if start_step >= obs_actor_b.shape[0]:
                             break
                     else:
@@ -299,7 +299,7 @@ class PPO:
                         # clipfracs += [((ratio - 1.0).abs() > self._clip_coef).float().mean().item()]
 
                     if self._use_norm_adv:
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-6)
 
                     # Policy loss
                     pg_loss1 = -advantages * ratio
