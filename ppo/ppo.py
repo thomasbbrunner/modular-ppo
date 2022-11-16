@@ -333,9 +333,9 @@ class PPO:
                     critic_state = critic_state.detach() if torch.is_tensor(critic_state) else None
 
                     losses += loss.item()
-                    v_losses += v_loss.item()
+                    v_losses += self._vf_coef*v_loss.item()
                     pg_losses += pg_loss.item()
-                    entropy_losses += entropy_loss.item()
+                    entropy_losses += self._ent_coef*entropy_loss.item()
                     if calc_extra_loss is not None:
                         extra_losses += extra_loss.item()
 
